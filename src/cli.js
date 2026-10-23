@@ -311,14 +311,46 @@ async function screen(exits) {
 }
 
 // ------------------------------------------------------------------- mail
-// temp.tf hands out plus-aliases on its pool of *real* gmail accounts
-// (`?providers=gmail&dot=0&plus=1` hands back a plus-alias on a real gmail account),
-// a private inbox and one of the 12 suffixes this panel allows. Emailnator's
-// public gmails are shared and spam-flooded (measured 2026-10-23: the panel's own
-// mail was not readable at all alongside the inbox's other traffic), so they are
-// only kept as an explicit fallback (`--mail emailnator`).
+// The panel normalises `+tag` **and** dots into the same address, so a dotted or
+// plus-aliased gmail can only ever register one account (`409 EMAIL_EXISTS`).
+// Emailnator hands out gmails whose **local part is genuinely different**, which
+// the panel does see as separate addresses — so that is the default rail, and an
+// address ledger (`out/used-gmail.txt`) is kept read-merged so a box is used once.
+// temp.tf stays available (`--mail temptf`) for panels that refuse public boxes.
+const LEDGER = path.join(OUT_DIR, 'used-gmail.txt');
+function loadLedger() {
+  try { return new Set(fs.readFileSync(LEDGER, 'utf8').split(/\r?\n/).map((s) => s.trim().toLowerCase()).filter(Boolean)); } catch { return new Set(); }
+}
+function noteUsed(address) {
+  try { fs.appendFileSync(LEDGER, String(address).toLowerCase() + '\n'); } catch (e) { /* non-fatal */ }
+}
+
 async function newMailbox(exit) {
-  if (MAIL === 'emailnator') {
+  const used = loadLedger();
+  if (MAIL === 'temptf') {
+    // The mailbox *base* is the identity that matters: the panel takes a plus
+    // alias as its own address (that is how the first six keys registered), but a
+    // base that already holds an account answers `409 EMAIL_EXISTS` for every one
+    // of its aliases — so the base is what the ledger dedupes, and temp.tf is
+    // asked again until it hands out one that has not been spent.
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const r = await exitJson(exit, `${TEMPTF}/api/account?providers=gmail&dot=0&plus=1`);
+      const address = String((r.json && r.json.email) || '').trim();
+      if (!/@/.test(address)) throw new Error(`temp.tf account ${r.status}: ${String(r.text).slice(0, 120)}`);
+      const base = address.split('@')[0].split('+')[0].toLowerCase();
+      if (used.has(base)) continue;
+      noteUsed(base);
+      return { rail: 'temptf', plain: address };
+    }
+    throw new Error('temp.tf handed back only bases already spent (see out/used-gmail.txt)');
+  }
+  // The panel folds dots before it mails, so the code lands in the *stripped*
+  // box, never the dotted one it was handed: measured 2026-10-23 through one
+ // pinned exit (out probe, a plain gmail mailbox got the code on the plain
+  // box while the dotted box held 0 panel mails for 90 s). So the stripped form
+  // is what the panel is given and what Emailnator is polled for; the ledger
+  // dedupes on the same stripped local because that is the panel's identity.
+  for (let attempt = 0; attempt < 6; attempt++) {
     const r = await exitJson(exit, `${EMAILNATOR}/api/generate-email`, {
       method: 'POST',
       body: { ids: [3] },
@@ -326,16 +358,16 @@ async function newMailbox(exit) {
     });
     const dotted = r.json && r.json.email;
     if (!dotted || !/@gmail\.com$/i.test(dotted)) throw new Error(`emailnator generate ${r.status}: ${String(r.text).slice(0, 120)}`);
-    const [local, domain] = dotted.split('@');
-    return { rail: 'emailnator', dotted, plain: `${local.replace(/\./g, '')}@${domain}` };
+    const domain = dotted.split('@')[1].toLowerCase();
+    const local = dotted.split('@')[0].replace(/\./g, '').toLowerCase();
+    if (used.has(local)) continue;
+    noteUsed(local);
+    return { rail: 'emailnator', plain: `${local}@${domain}` };
   }
-  const r = await exitJson(exit, `${TEMPTF}/api/account?providers=gmail&dot=0&plus=1`);
-  const address = String((r.json && r.json.email) || '').trim();
-  if (!/@/.test(address)) throw new Error(`temp.tf account ${r.status}: ${String(r.text).slice(0, 120)}`);
-  return { rail: 'temptf', dotted: address, plain: address };
+  throw new Error('emailnator handed back only already-used addresses (see out/used-gmail.txt)');
 }
 
-/** One inbox snapshot: [{id, subject, text}] — newest first as the rail returns it. */
+/** One inbox snapshot: [{id, from, subject, text}] — newest first as the rail returns it. */
 async function inbox(exit, box) {
   try {
     const r = box.rail === 'temptf'
@@ -344,27 +376,46 @@ async function inbox(exit, box) {
     const rows = (r.json && (r.json.data || r.json.messages)) || [];
     const out = [];
     for (const m of rows) {
+      const ts = Number(m.timestamp || m.ts || 0) || 0;
+      const from = m.from || '', subject = m.subject || '';
       if (box.rail === 'temptf') {
-        out.push({ id: String(m.id), subject: m.subject || '', text: `${m.subject || ''} ${m.text || m.html || m.body || ''}` });
+        out.push({ id: String(m.id), ts, from, subject, text: `${subject} ${m.text || m.html || m.body || ''}` });
+      } else if (!PANEL_MAIL.test(`${from} ${subject}`)) {
+        // A public inbox carries other people's mail; one body fetch per row costs a round
+        // trip each, so only the panel's own rows are pulled.
+        out.push({ id: String(m.id), ts, from, subject, text: '' });
       } else {
         const full = await exitJson(exit, `${EMAILNATOR}/api/message/${encodeURIComponent(m.id)}`).catch(() => null);
-        out.push({ id: String(m.id), subject: m.subject || '', text: String((full && full.text) || '') });
+        // The rail answers { id, from, subject, date, content }: only `content` is
+        // the mail. The raw payload is that JSON envelope, and its `"date":<epoch>`
+        // sat between the word "code" and a 6-digit run, so the loose code regex
+        // read the epoch prefix as the code (179276 for a 288685 mail, measured
+        // 2026-10-23) and every register burned itself on INVALID_VERIFY_CODE.
+        out.push({ id: String(m.id), ts, from, subject, text: String((full && full.json && (full.json.content || full.json.body || full.json.html)) || '') });
       }
     }
     return out;
   } catch (e) { return []; }
 }
 
-// A shared/public inbox can hand back codes that are not ours, so every 6-digit
-// candidate is offered to the register call: the panel answers
-// INVALID_VERIFY_CODE for the wrong one and tokens for the right one.
-async function pollCode(exit, box, ignore, attempt, { timeoutMs = 180000, pollMs = 5000 } = {}) {
+// Emailnator's gmail pool is public and spam-flooded: a "code" mail that is not
+// the panel's own (Massmutual, Vivakard, …) would be submitted as ours and the
+// register call burns its attempt budget on it (`VERIFY_CODE_MAX_ATTEMPTS`,
+// measured 2026-10-23). Only the panel's own mail counts — measured shape:
+ // `Best AI <sender@panel>` / `[Best AI] Email verification code`.
+const PANEL_MAIL = /aisale\.best|best\s*ai/i;
+async function pollCode(exit, box, ignore, attempt, { timeoutMs = 180000, pollMs = 5000, since = 0 } = {}) {
   const deadline = Date.now() + timeoutMs;
   let tried = 0;
   while (Date.now() < deadline) {
-    for (const m of await inbox(exit, box)) {
+    // Emailnator re-issues message ids on every call, so an id baseline is no fence:
+    // an old panel mail in a shared box comes back looking new and its stale code
+    // burns a register attempt (VERIFY_CODE_MAX_ATTEMPTS). Fence on send time, newest first.
+    const fresh = (await inbox(exit, box))
+      .filter((m) => (since && m.ts ? m.ts >= since : !ignore.has(m.id)))
+      .sort((a, b) => (b.ts || 0) - (a.ts || 0));
+    for (const m of fresh) {
       if (ignore.has(m.id)) continue;
-      ignore.add(m.id);
       const code = String(m.text).replace(/<[^>]+>/g, ' ').match(/(?:code|verification|验证码)[^\d]{0,30}(\d{6})/i);
       if (!code) continue;
       tried++;
@@ -387,6 +438,7 @@ async function signUp(exit) {
   const password = randPass();
   const box = await newMailbox(exit);
   const baseline = new Set((await inbox(exit, box)).map((m) => m.id));
+  const since = Math.floor(Date.now() / 1000) - 45;
   const sc = await exitJson(exit, `${API}/auth/send-verify-code`, { method: 'POST', body: { email: box.plain } });
   if (!(sc.json && sc.json.code === 0)) throw new Error(`send-verify-code HTTP ${sc.status}: ${String(sc.text).slice(0, 140)}`);
   let reg = null;
@@ -399,7 +451,7 @@ async function signUp(exit) {
     if (d.access_token) { reg = r; return true; }
     if (r.json && r.json.reason === 'INVALID_VERIFY_CODE') return false;
     throw new Error(`register HTTP ${r.status}: ${String(r.text).slice(0, 140)}`);
-  });
+  }, { since });
   const data = (reg.json && reg.json.data) || reg.json || {};
   const token = data.access_token;
   if (!token) throw new Error(`register HTTP ${reg.status}: ${String(reg.text).slice(0, 140)}`);
